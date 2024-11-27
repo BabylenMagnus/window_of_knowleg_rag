@@ -32,9 +32,7 @@ def add_into_collection(data: str, collection_name: str):
 
 if __name__ == '__main__':
     urls = [
-        "https://www.xtremepush.com/blog/leveraging-plug-play-predictions-for-omnichannel-campaigns",
-        "https://www.xtremepush.com/blog/ace-your-casino-with-this-casino-crm-software-checklist",
-        "https://www.xtremepush.com/blog/ultimate-guide-how-gamification-ai-models-and-infinityai-are-changing-igaming"
+        "https://www.xtremepush.com/blog/improve-player-experience",
     ]
     collection = chroma_client.get_or_create_collection("test")
     print("start with ", collection.count())
