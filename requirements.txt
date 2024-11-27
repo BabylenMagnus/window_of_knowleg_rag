@@ -1,0 +1,4 @@
+chromadb
+transformers
+html2text
+beautifulsoup4
