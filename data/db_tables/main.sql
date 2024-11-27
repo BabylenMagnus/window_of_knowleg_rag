@@ -3,7 +3,8 @@ CREATE TABLE storages (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
     name VARCHAR(255) NOT NULL,
-    description TEXT
+    description TEXT,
+    nickname VARCHAR(63) NOT NULL UNIQUE
 );
 
 CREATE TABLE models (
@@ -17,7 +18,6 @@ CREATE TABLE models (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
 );
 
--- Создание таблицы files
 CREATE TABLE files (
     id SERIAL PRIMARY KEY,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
