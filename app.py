@@ -1,3 +1,7 @@
+import os
+# Disable ChromaDB telemetry
+os.environ['ANONYMIZED_TELEMETRY'] = 'False'
+
 import json
 import chromadb
 from fastapi import FastAPI, Request, HTTPException
@@ -8,6 +12,7 @@ from pydantic import BaseModel
 from engine import model, prompt_template, semantic_search
 from add_data import add_into_collection
 from db import create_storage, list_storages, check_storage_nickname_exists, check_existing_records
+
 
 chroma_client = chromadb.HttpClient(host='localhost', port=8027)
 
@@ -34,9 +39,7 @@ async def query_simple_rag_stream(query: str, collection_name: str):
 app = FastAPI()
 
 # Добавляем CORS middleware
-origins = ["http://localhost:5173",  # Ваш фронтенд
-    # Добавьте другие origin, если необходимо
-]
+origins = ["http://localhost:5173", "http://localhost:3000", "http://localhost:8027"]
 
 app.add_middleware(
     CORSMiddleware,

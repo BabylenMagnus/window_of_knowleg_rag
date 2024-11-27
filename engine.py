@@ -1,3 +1,7 @@
+import os
+# Disable ChromaDB telemetry
+os.environ['ANONYMIZED_TELEMETRY'] = 'False'
+
 import chromadb
 from late_chunking import embed_model, tokenizer
 
