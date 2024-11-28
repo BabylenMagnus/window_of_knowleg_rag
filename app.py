@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_openai import ChatOpenAI
 
 # Disable ChromaDB telemetry
 os.environ['ANONYMIZED_TELEMETRY'] = 'False'
@@ -180,6 +181,44 @@ async def query_simple_rag_stream(query: str, collection_name: str, chat_id: int
         )
 
 
+# New function for OpenAI model query
+async def query_openai_model_stream(query: str, token: str, selected_model: str, chat_id: int):
+    try:
+        # Initialize the OpenAI model
+        llm = ChatOpenAI(
+            model=selected_model, api_key=token, timeout=40,
+            base_url="https://lk.neuroapi.host/v1"
+        )
+
+        # Prepare the context and history
+        results = semantic_search(query, "test")
+        context_text = "\n\n---\n\n".join(results['documents'][0])
+        sources = list(set([i.get("url", "pdf source") for i in results['metadatas'][0]]))
+
+        history = []
+        for i in get_last_n_messages(chat_id, 5):
+            history.append(
+                HumanMessage(i['text']) if i['author'] == 'user' else AIMessage(i['text'])
+            )
+
+        # Prepare the prompt
+        system_message_content = f"Answer the question based only on the following context:\n{context_text}\n---\n{query}"
+        prompt = [{"role": "system", "content": system_message_content}] + [
+            {"role": "user" if isinstance(msg, HumanMessage) else "assistant", "content": msg.content}
+            for msg in history
+        ]
+
+        # Generate response
+        response = llm.astream(prompt)
+        return response, sources
+
+    except Exception as e:
+        logger.error(f"OpenAI Query Error: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Error processing OpenAI query: {str(e)}"
+        )
+
+
 # Root Endpoint
 @app.get('/')
 async def root():
@@ -340,15 +379,26 @@ async def chat_endpoint_v2(request: Request):
         query = data.get('query')
         collection_name = data.get('collection_name', 'test')
         chat_id = data.get('chat_id')
+        token = data.get('token', '')
+        selected_model = data.get('selected_model', '')
+        with_gpt = data.get('with_gpt', False)
 
-        response_stream, sources = await query_simple_rag_stream(query, collection_name, chat_id)
+        if with_gpt and token and selected_model:
+            response_stream, sources = await query_openai_model_stream(query, token, selected_model, chat_id)
+        else:
+            response_stream, sources = await query_simple_rag_stream(query, collection_name, chat_id)
 
         async def event_generator():
             # First, send the sources as a JSON event
             yield f"data: {json.dumps({'sources': sources})}\n\n"
             # Now, send the response content as events
             async for chunk in response_stream:
-                yield f"data: {json.dumps({'content': chunk})}\n\n"
+                # Convert chunk to string for JSON serialization
+                if isinstance(chunk, str):
+                    chunk_content = chunk
+                else:
+                    chunk_content = chunk.content  # Fallback to string conversion
+                yield f"data: {json.dumps({'content': chunk_content})}\n\n"
 
         return StreamingResponse(event_generator(), media_type='text/event-stream')
 
