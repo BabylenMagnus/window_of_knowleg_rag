@@ -8,7 +8,7 @@ embed_model = AutoModel.from_pretrained("deepvk/USER-bge-m3")
 embed_model.eval()
 
 large_splitter = TokenTextSplitter.from_huggingface_tokenizer(
-    tokenizer=tokenizer, chunk_size=8192, chunk_overlap=128
+    tokenizer=tokenizer, chunk_size=8000, chunk_overlap=128
 )
 small_splitter = TokenTextSplitter.from_huggingface_tokenizer(
     tokenizer=tokenizer, chunk_size=512, chunk_overlap=64
