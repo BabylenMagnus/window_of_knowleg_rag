@@ -301,3 +301,34 @@ def create_chat_history(chat_id: int, text: str, author: str):
         return serialize_db_result(new_history_entry)
     finally:
         conn.close()
+
+
+def get_last_n_messages(chat_id: int, n: int = 5):
+    """
+    Get the last N messages from a chat's history.
+    
+    Args:
+        chat_id (int): ID of the chat
+        n (int): Number of messages to retrieve (default: 5)
+    
+    Returns:
+        List of chat history records, ordered from oldest to newest
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM chat_history 
+                WHERE chat_id = %s 
+                ORDER BY created_at DESC 
+                LIMIT %s
+                """, 
+                (chat_id, n)
+            )
+            messages = cur.fetchall()
+            # Reverse the messages to get them in chronological order
+            messages.reverse()
+        return [serialize_db_result(msg) for msg in messages]
+    finally:
+        conn.close()

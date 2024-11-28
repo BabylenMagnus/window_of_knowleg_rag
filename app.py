@@ -20,8 +20,10 @@ from db import (
     get_db_connection, create_storage, list_storages, 
     check_storage_nickname_exists, check_existing_records,
     get_chats, create_chat, get_chat_history, create_chat_history,
-    list_models, ensure_dummy_model
+    list_models, get_last_n_messages
 )
+
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 
 chroma_client = chromadb.HttpClient(host='localhost', port=8027)
@@ -50,15 +52,19 @@ class ChatHistoryCreate(BaseModel):
     author: Literal['user', 'model']
 
 
-async def query_simple_rag_stream(query: str, collection_name: str):
+async def query_simple_rag_stream(query: str, collection_name: str, chat_id: int):
     results = semantic_search(query, collection_name)
 
     # Prepare the context and sources
     context_text = "\n\n---\n\n".join(results['documents'][0])
     sources = list(set([i['url'] for i in results['metadatas'][0]]))
-    prompt = prompt_template.format(context=context_text, question=query)
+    history = []
+    for i in get_last_n_messages(chat_id, 5):
+        history.append(HumanMessage(i['text']) if i['author'] == 'user' else AIMessage(i['text']))
 
-    # Get the async stream from the model
+    system_message_content = prompt_template.format(context=context_text, question=query)
+    prompt = [SystemMessage(system_message_content)] + history
+
     response_stream = model.astream(prompt)
     return response_stream, sources
 
@@ -87,8 +93,9 @@ async def chat_endpoint(request: Request):
     data = await request.json()
     query = data.get('query')
     collection_name = data.get('collection_name', 'test')
+    chat_id = data.get('chat_id')
 
-    response_stream, sources = await query_simple_rag_stream(query, collection_name)
+    response_stream, sources = await query_simple_rag_stream(query, collection_name, chat_id)
 
     async def event_generator():
         # First, send the sources as a JSON event
@@ -105,8 +112,9 @@ async def chat_endpoint_v2(request: Request):
     data = await request.json()
     query = data.get('query')
     collection_name = data.get('collection_name', 'test')
+    chat_id = data.get('chat_id')
 
-    response_stream, sources = await query_simple_rag_stream(query, collection_name)
+    response_stream, sources = await query_simple_rag_stream(query, collection_name, chat_id)
 
     async def event_generator():
         # First, send the sources as a JSON event

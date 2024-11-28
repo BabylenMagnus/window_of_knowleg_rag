@@ -15,7 +15,7 @@ PROMPT_TEMPLATE = """
 Answer the question based only on the following context:
 {context}
 ---
-Answer the question based on the above context: {question}
+Answer the question based on the above context and chat history: {question}
 """
 prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
 model = OllamaLLM(model="hf.co/mav23/Vikhr-Nemo-12B-Instruct-R-21-09-24-GGUF:Q8_0")
