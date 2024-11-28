@@ -36,6 +36,7 @@ from db import (get_db_connection, create_storage, list_storages, check_storage_
                 update_storage, get_storage_files, get_file_details, get_storage_by_id, add_url_to_storage_collection,
                 save_file, delete_storage_file, update_file_info)
 
+
 # Utility Functions
 def handle_exception(e: Exception, status_code: int = 500) -> JSONResponse:
     """
@@ -156,7 +157,7 @@ async def query_simple_rag_stream(query: str, collection_name: str, chat_id: int
         results = semantic_search(query, collection_name)
 
         context_text = "\n\n---\n\n".join(results['documents'][0])
-        sources = list(set([i['url'] for i in results['metadatas'][0]]))
+        sources = list(set([i.get("url", "pdf source") for i in results['metadatas'][0]]))
 
         history = []
         for i in get_last_n_messages(chat_id, 5):
@@ -249,7 +250,6 @@ async def add_url_endpoint(request: Request):
     try:
         data = await request.json()
         url = data.get("url")
-        collection_nickname = data.get("collection_nickname")
 
         # Validate inputs
         if not url:
@@ -262,17 +262,7 @@ async def add_url_endpoint(request: Request):
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid URL format"
             )
 
-        if not collection_nickname:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="Collection nickname is required"
-            )
-
-        if not check_storage_nickname_exists(collection_nickname):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Storage with this nickname not found"
-            )
-
-        add_into_collection(url, collection_nickname)
+        add_into_collection(url, "test")
         return JSONResponse(
             content={"status": "success", "message": "Data added successfully"}
         )
@@ -460,7 +450,6 @@ async def add_chat(chat_data: ChatCreate):
     )
 
 
-# Retrieve Chat History Endpoint
 @app.get("/chat_history/{chat_id}")
 async def retrieve_chat_history(chat_id: int):
     """
@@ -475,7 +464,6 @@ async def retrieve_chat_history(chat_id: int):
     return get_chat_history(chat_id)
 
 
-# Save Chat History Endpoint
 @app.post("/chat_history")
 async def save_chat_history(chat_history: ChatHistoryCreate):
     """
@@ -492,7 +480,6 @@ async def save_chat_history(chat_history: ChatHistoryCreate):
     )
 
 
-# List Models Endpoint
 @app.get("/models")
 async def get_models():
     """
@@ -504,7 +491,6 @@ async def get_models():
     return list_models()
 
 
-# Delete File Endpoint
 @app.delete("/storages/{storage_id}/files/{file_id}")
 async def delete_file(storage_id: int, file_id: int):
     """
@@ -558,6 +544,101 @@ async def update_file_metadata(storage_id: int, file_id: int, metadata: dict = B
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=str(e)
         )
+
+
+# Add PDF validation function
+def validate_pdf(file: UploadFile) -> bool:
+    """
+    Validate if file is a PDF
+    
+    Args:
+        file (UploadFile): File to validate
+        
+    Returns:
+        bool: Whether file is a valid PDF
+    """
+    # Check content type
+    if file.content_type != "application/pdf":
+        return False
+    
+    # Check file extension
+    return file.filename.lower().endswith('.pdf')
+
+
+# Modify the existing upload endpoint or add a new one specifically for PDFs
+@app.post("/upload-pdf")
+async def upload_pdf(
+    storage_id: int, 
+    file: UploadFile = File(...),
+    description: Optional[str] = Form(None)
+):
+    """
+    Upload PDF file to storage
+    
+    Args:
+        storage_id (int): Storage ID
+        file (UploadFile): PDF file to upload
+        description (Optional[str]): File description
+    
+    Returns:
+        JSONResponse with file information
+    """
+    try:
+        # Validate storage
+        storage = get_storage_by_id(storage_id)
+
+        # Validate PDF format
+        if not validate_pdf(file):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file format. Only PDF files are allowed."
+            )
+
+        # Validate file size (50MB limit)
+        if not validate_file_size(file):
+            raise HTTPException(
+                status_code=400,
+                detail="File exceeds maximum size of 50MB"
+            )
+
+        # Create storage-specific upload directory
+        upload_dir = os.path.join(os.getcwd(), 'uploads', str(storage_id))
+        os.makedirs(upload_dir, exist_ok=True)
+
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_filename = f"{timestamp}_{file.filename}"
+        local_path = os.path.join(upload_dir, safe_filename)
+
+        # Save file
+        async with aiofiles.open(local_path, 'wb') as f:
+            content = await file.read()
+            await f.write(content)
+
+        # Process PDF for vector storage
+        try:
+            add_into_collection(local_path, f"test")
+        except Exception as e:
+            logger.error(f"Error processing PDF for vector storage: {e}")
+            # Continue even if vector processing fails
+            # You may want to add a status flag in the response
+
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED,
+            content={
+                "status": "success",
+                "message": "PDF uploaded and processed successfully"
+            }
+        )
+
+    except Exception as e:
+        # Clean up file if saved but processing failed
+        if 'local_path' in locals() and os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except:
+                pass
+        return handle_exception(e)
 
 
 if __name__ == '__main__':

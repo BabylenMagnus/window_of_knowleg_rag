@@ -18,12 +18,12 @@ Answer the question based only on the following context:
 Answer the question based on the above context and chat history: {question}
 """
 prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-# model = OllamaLLM(model="hf.co/mav23/Vikhr-Nemo-12B-Instruct-R-21-09-24-GGUF:Q8_0")
-model = OllamaLLM(model="llama3.2")
+model = OllamaLLM(model="hf.co/mav23/Vikhr-Nemo-12B-Instruct-R-21-09-24-GGUF:Q8_0")
+# model = OllamaLLM(model="llama3.2")
 
 
 def semantic_search(query, collection_name):
-    collection = chroma_client.get_or_create_collection(name=collection_name)
+    collection = chroma_client.get_or_create_collection(name="test")
     embeds = embed_model(**tokenizer(query, return_tensors='pt'))
     results = collection.query(
         query_embeddings=embeds.pooler_output.detach().cpu().numpy(), n_results=3

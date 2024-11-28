@@ -2,3 +2,4 @@ chromadb
 transformers
 html2text
 beautifulsoup4
+PyMuPDF
