@@ -1,195 +1,437 @@
 import os
-# Disable ChromaDB telemetry
-os.environ['ANONYMIZED_TELEMETRY'] = 'False'
-
 import json
-import chromadb
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Literal
 import logging
+import traceback
+from datetime import datetime
+from typing import Optional, Literal, Dict, Any, List
 
-# Add basic logging configuration
-logging.basicConfig(level=logging.INFO)
+import chromadb
+import aiofiles
+import mimetypes
+import aiohttp
+import urllib.parse
 
-from engine import model, prompt_template, semantic_search
-from add_data import add_into_collection
-from db import (
-    get_db_connection, create_storage, list_storages, 
-    check_storage_nickname_exists, check_existing_records,
-    get_chats, create_chat, get_chat_history, create_chat_history,
-    list_models, get_last_n_messages
-)
+from fastapi import (FastAPI, Request, HTTPException, File, Form, UploadFile, Body, status)
+from fastapi.responses import (StreamingResponse, PlainTextResponse, JSONResponse)
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, validator
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
+# Disable ChromaDB telemetry
+os.environ['ANONYMIZED_TELEMETRY'] = 'False'
 
-chroma_client = chromadb.HttpClient(host='localhost', port=8027)
+# Enhanced logging configuration
+logging.basicConfig(
+    level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), logging.FileHandler('app.log', encoding='utf-8')]
+)
+logger = logging.getLogger(__name__)
+
+# Import local modules
+from engine import model, prompt_template, semantic_search
+from add_data import add_into_collection
+from db import (get_db_connection, create_storage, list_storages, check_storage_nickname_exists, check_existing_records,
+                get_chats, create_chat, get_chat_history, create_chat_history, list_models, get_last_n_messages,
+                update_storage, get_storage_files, get_file_details, get_storage_by_id, add_url_to_storage_collection,
+                save_file, delete_storage_file, update_file_info)
+
+# Utility Functions
+def handle_exception(e: Exception, status_code: int = 500) -> JSONResponse:
+    """
+    Centralized exception handling utility
+    
+    Args:
+        e (Exception): Caught exception
+        status_code (int): HTTP status code
+    
+    Returns:
+        JSONResponse with error details
+    """
+    logger.error(f"Error: {e}")
+    logger.error(traceback.format_exc())
+
+    return JSONResponse(
+        status_code=status_code, content={"status": "error", "message": str(e), "details": traceback.format_exc()}
+    )
 
 
-# Модели данных
+def validate_url(url: str) -> bool:
+    """
+    Validate URL format
+    
+    Args:
+        url (str): URL to validate
+    
+    Returns:
+        bool: Whether URL is valid
+    """
+    try:
+        result = urllib.parse.urlparse(url)
+        return all([result.scheme, result.netloc])
+    except Exception:
+        return False
+
+
+def validate_file_size(file: UploadFile, max_size: int = 50 * 1024 * 1024) -> bool:
+    """
+    Validate file size
+    
+    Args:
+        file (UploadFile): Uploaded file
+        max_size (int): Maximum file size in bytes
+    
+    Returns:
+        bool: Whether file size is acceptable
+    """
+    return file.size <= max_size if hasattr(file, 'size') else True
+
+
+def get_file_type(filename: str) -> str:
+    """
+    Determine file type by extension
+    
+    Args:
+        filename (str): Filename to check
+    
+    Returns:
+        str: File type
+    """
+    mime_type, _ = mimetypes.guess_type(filename)
+    if mime_type:
+        return mime_type.split('/')[0]
+    return 'unknown'
+
+
+# Pydantic Models
 class StorageCreate(BaseModel):
     name: str
-    description: str = None
+    description: Optional[str] = None
+
+    @validator('name')
+    def validate_name(cls, v):
+        if not v or len(v.strip()) < 2:
+            raise ValueError('Storage name must be at least 2 characters long')
+        return v.strip()
+
+
+class StorageUpdate(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+    @validator('name')
+    def validate_name(cls, v):
+        if not v or len(v.strip()) < 2:
+            raise ValueError('Storage name must be at least 2 characters long')
+        return v.strip()
 
 
 class ChatCreate(BaseModel):
-    """
-    Pydantic model for creating a new chat
-    """
     name: str
     model_id: Optional[int] = None
 
 
 class ChatHistoryCreate(BaseModel):
-    """
-    Pydantic model for creating a new chat history entry
-    """
     chat_id: int
     text: str
     author: Literal['user', 'model']
 
 
-async def query_simple_rag_stream(query: str, collection_name: str, chat_id: int):
-    results = semantic_search(query, collection_name)
+# ChromaDB Client
+chroma_client = chromadb.HttpClient(host='localhost', port=8027)
 
-    # Prepare the context and sources
-    context_text = "\n\n---\n\n".join(results['documents'][0])
-    sources = list(set([i['url'] for i in results['metadatas'][0]]))
-    history = []
-    for i in get_last_n_messages(chat_id, 5):
-        history.append(HumanMessage(i['text']) if i['author'] == 'user' else AIMessage(i['text']))
-
-    system_message_content = prompt_template.format(context=context_text, question=query)
-    prompt = [SystemMessage(system_message_content)] + history
-
-    response_stream = model.astream(prompt)
-    return response_stream, sources
-
-
+# FastAPI App
 app = FastAPI()
 
-# Добавляем CORS middleware
+# CORS Configuration
 origins = ["http://localhost:5173", "http://localhost:3000", "http://localhost:8027"]
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"], )
 
 
+# Async RAG Query Function
+async def query_simple_rag_stream(query: str, collection_name: str, chat_id: int):
+    try:
+        results = semantic_search(query, collection_name)
+
+        context_text = "\n\n---\n\n".join(results['documents'][0])
+        sources = list(set([i['url'] for i in results['metadatas'][0]]))
+
+        history = []
+        for i in get_last_n_messages(chat_id, 5):
+            history.append(
+                HumanMessage(i['text']) if i['author'] == 'user' else AIMessage(i['text'])
+            )
+
+        system_message_content = prompt_template.format(
+            context=context_text, question=query
+        )
+        prompt = [SystemMessage(system_message_content)] + history
+
+        response_stream = model.astream(prompt)
+        return response_stream, sources
+
+    except Exception as e:
+        logger.error(f"RAG Query Error: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Error processing RAG query: {str(e)}"
+        )
+
+
+# Root Endpoint
 @app.get('/')
 async def root():
-    return PlainTextResponse("Здарова бандиты")
+    return PlainTextResponse("Window of Knowledge Backend")
 
 
-@app.get('/chatting')
-async def chat_endpoint(request: Request):
-    data = await request.json()
-    query = data.get('query')
-    collection_name = data.get('collection_name', 'test')
-    chat_id = data.get('chat_id')
+# File Upload Endpoint
+@app.post("/storages/{storage_id}/files", response_model=Dict[str, Any])
+async def upload_file(storage_id: int, file: UploadFile = File(...), description: Optional[str] = Form(None)):
+    """
+    Upload file to storage with comprehensive validation and error handling
+    
+    Args:
+        storage_id (int): Storage ID
+        file (UploadFile): File to upload
+        description (Optional[str]): File description
+    
+    Returns:
+        JSONResponse with file information
+    """
+    try:
+        # Validate storage
+        storage = get_storage_by_id(storage_id)
 
-    response_stream, sources = await query_simple_rag_stream(query, collection_name, chat_id)
+        # Validate file
+        if not validate_file_size(file):
+            raise ValueError("File exceeds maximum size of 50MB")
 
-    async def event_generator():
-        # First, send the sources as a JSON event
-        yield f"data: {json.dumps({'sources': sources})}\n\n"
-        # Now, send the response content as events
-        async for chunk in response_stream:
-            yield f"data: {json.dumps({'content': chunk})}\n\n"
+        # Create storage-specific upload directory
+        upload_dir = os.path.join(os.getcwd(), 'uploads', str(storage_id))
+        os.makedirs(upload_dir, exist_ok=True)
 
-    return StreamingResponse(event_generator(), media_type='text/event-stream')
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_filename = f"{timestamp}_{file.filename}"
+        local_path = os.path.join(upload_dir, safe_filename)
+
+        # Save file
+        async with aiofiles.open(local_path, 'wb') as f:
+            content = await file.read()
+            await f.write(content)
+
+        # Determine file type
+        file_type = get_file_type(file.filename)
+
+        # Save to database
+        file_info = save_file(
+            storage_id=storage_id, 
+            filename=file.filename, 
+            local_path=local_path, 
+            file_type=file_type,
+            source='upload',
+            description=description
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED,
+            content={"status": "success", "message": "File uploaded successfully", "file": file_info}
+        )
+
+    except Exception as e:
+        return handle_exception(e)
 
 
-@app.post('/chatting_v2')
-async def chat_endpoint_v2(request: Request):
-    data = await request.json()
-    query = data.get('query')
-    collection_name = data.get('collection_name', 'test')
-    chat_id = data.get('chat_id')
-
-    response_stream, sources = await query_simple_rag_stream(query, collection_name, chat_id)
-
-    async def event_generator():
-        # First, send the sources as a JSON event
-        yield f"data: {json.dumps({'sources': sources})}\n\n"
-        # Now, send the response content as events
-        async for chunk in response_stream:
-            yield f"data: {json.dumps({'content': chunk})}\n\n"
-
-    return StreamingResponse(event_generator(), media_type='text/event-stream')
-
-
+# URL Addition Endpoint
 @app.post("/add-url")
 async def add_url_endpoint(request: Request):
     try:
         data = await request.json()
         url = data.get("url")
         collection_nickname = data.get("collection_nickname")
-        
+
+        # Validate inputs
         if not url:
-            raise HTTPException(status_code=400, detail="URL is required")
-            
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="URL is required"
+            )
+
+        if not validate_url(url):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid URL format"
+            )
+
         if not collection_nickname:
-            raise HTTPException(status_code=400, detail="Collection nickname is required")
-            
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Collection nickname is required"
+            )
+
         if not check_storage_nickname_exists(collection_nickname):
-            raise HTTPException(status_code=404, detail="Storage with this nickname not found")
-            
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Storage with this nickname not found"
+            )
+
         add_into_collection(url, collection_nickname)
-        return JSONResponse(content={"status": "success", "message": "Data added successfully"})
-        
-    except HTTPException as e:
-        raise e
-    except Exception as e:
         return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
+            content={"status": "success", "message": "Data added successfully"}
         )
 
+    except Exception as e:
+        return handle_exception(e)
 
+
+# Storage Creation Endpoint
 @app.post("/storages")
 async def create_storage_endpoint(storage: StorageCreate):
     try:
         result = create_storage(storage.name, storage.description)
-        return JSONResponse(content={"status": "success", "data": result})
-    except Exception as e:
         return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
+            content={"status": "success", "data": result}
+        )
+    except Exception as e:
+        return handle_exception(e)
+
+
+# Storage Update Endpoint
+@app.put("/storages/{storage_id}")
+async def update_storage_endpoint(storage_id: int, storage_data: StorageUpdate):
+    """
+    Update storage name and description
+    
+    Args:
+        storage_id: int - ID of storage to update
+        storage_data (StorageUpdate):
+            - name: str
+            - description: str (optional)
+    
+    Returns:
+        Updated storage record
+    """
+    try:
+        return update_storage(
+            storage_id=storage_id, name=storage_data.name, description=storage_data.description
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(e)
         )
 
 
+# Chatting Endpoint
+@app.get('/chatting')
+async def chat_endpoint(request: Request):
+    try:
+        data = await request.json()
+        query = data.get('query')
+        collection_name = data.get('collection_name', 'test')
+        chat_id = data.get('chat_id')
+
+        response_stream, sources = await query_simple_rag_stream(query, collection_name, chat_id)
+
+        async def event_generator():
+            # First, send the sources as a JSON event
+            yield f"data: {json.dumps({'sources': sources})}\n\n"
+            # Now, send the response content as events
+            async for chunk in response_stream:
+                yield f"data: {json.dumps({'content': chunk})}\n\n"
+
+        return StreamingResponse(event_generator(), media_type='text/event-stream')
+
+    except Exception as e:
+        return handle_exception(e)
+
+
+# Chatting V2 Endpoint
+@app.post('/chatting_v2')
+async def chat_endpoint_v2(request: Request):
+    try:
+        data = await request.json()
+        query = data.get('query')
+        collection_name = data.get('collection_name', 'test')
+        chat_id = data.get('chat_id')
+
+        response_stream, sources = await query_simple_rag_stream(query, collection_name, chat_id)
+
+        async def event_generator():
+            # First, send the sources as a JSON event
+            yield f"data: {json.dumps({'sources': sources})}\n\n"
+            # Now, send the response content as events
+            async for chunk in response_stream:
+                yield f"data: {json.dumps({'content': chunk})}\n\n"
+
+        return StreamingResponse(event_generator(), media_type='text/event-stream')
+
+    except Exception as e:
+        return handle_exception(e)
+
+
+# List Storages Endpoint
 @app.get("/list_storages")
 async def list_storages_endpoint():
     try:
         result = list_storages()
-        return JSONResponse(content={"status": "success", "data": result})
-    except Exception as e:
         return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
+            content={"status": "success", "data": result}
         )
+    except Exception as e:
+        return handle_exception(e)
 
 
+# Check Records Endpoint
 @app.get("/check-records")
 async def check_records_endpoint():
     try:
         result = check_existing_records()
-        return JSONResponse(content={"status": "success", "data": result})
-    except Exception as e:
         return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)}
+            content={"status": "success", "data": result}
+        )
+    except Exception as e:
+        return handle_exception(e)
+
+
+# List Storage Files Endpoint
+@app.get("/storages/{storage_id}/files")
+async def list_storage_files(storage_id: int):
+    """
+    Get list of files in storage
+    
+    Args:
+        storage_id: int - ID of storage to get files from
+    
+    Returns:
+        List of files in storage
+    """
+    try:
+        return get_storage_files(storage_id)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(e)
         )
 
 
+# Get File Info Endpoint
+@app.get("/storages/{storage_id}/files/{file_id}")
+async def get_file_info(storage_id: int, file_id: int):
+    """
+    Get detailed information about a specific file
+    
+    Args:
+        storage_id: int - ID of storage
+        file_id: int - ID of file
+    
+    Returns:
+        File information including metadata
+    """
+    try:
+        return get_file_details(storage_id, file_id)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(e)
+        )
+
+
+# List Chats Endpoint
 @app.get("/chats")
 async def list_chats():
     """
@@ -201,6 +443,7 @@ async def list_chats():
     return get_chats()
 
 
+# Create Chat Endpoint
 @app.post("/chats")
 async def add_chat(chat_data: ChatCreate):
     """
@@ -213,11 +456,11 @@ async def add_chat(chat_data: ChatCreate):
         Dict representing the newly created chat
     """
     return create_chat(
-        name=chat_data.name, 
-        model_id=chat_data.model_id
+        name=chat_data.name, model_id=chat_data.model_id
     )
 
 
+# Retrieve Chat History Endpoint
 @app.get("/chat_history/{chat_id}")
 async def retrieve_chat_history(chat_id: int):
     """
@@ -232,6 +475,7 @@ async def retrieve_chat_history(chat_id: int):
     return get_chat_history(chat_id)
 
 
+# Save Chat History Endpoint
 @app.post("/chat_history")
 async def save_chat_history(chat_history: ChatHistoryCreate):
     """
@@ -244,12 +488,11 @@ async def save_chat_history(chat_history: ChatHistoryCreate):
         Dict representing the newly created chat history entry
     """
     return create_chat_history(
-        chat_id=chat_history.chat_id,
-        text=chat_history.text,
-        author=chat_history.author
+        chat_id=chat_history.chat_id, text=chat_history.text, author=chat_history.author
     )
 
 
+# List Models Endpoint
 @app.get("/models")
 async def get_models():
     """
@@ -261,36 +504,63 @@ async def get_models():
     return list_models()
 
 
-def create_dummy_model_if_not_exists():
+# Delete File Endpoint
+@app.delete("/storages/{storage_id}/files/{file_id}")
+async def delete_file(storage_id: int, file_id: int):
     """
-    Create a dummy model with ID 1 if it doesn't exist in the models table.
+    Delete file from storage
+    
+    Args:
+        storage_id: int - ID of storage
+        file_id: int - ID of file
+        
+    Returns:
+        Success status
     """
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            # Try to insert the dummy model, ignoring if it already exists
-            cur.execute("""
-                INSERT INTO models (
-                    id, name, model_path, type, context_window
-                ) VALUES (
-                    1, 
-                    'Dummy Model', 
-                    '/dev/null', 
-                    'service', 
-                    2048
-                ) 
-                ON CONFLICT (id) DO NOTHING
-            """)
-            conn.commit()
-    except Exception as e:
-        logging.error(f"Error creating dummy model: {e}")
-    finally:
-        conn.close()
+        local_path = delete_storage_file(storage_id, file_id)
+
+        # Delete physical file if it exists
+        if os.path.exists(local_path):
+            os.remove(local_path)
+
+        return JSONResponse(
+            content={"status": "success", "message": "File deleted"}
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(e)
+        )
+
+
+# Update File Metadata Endpoint
+@app.patch("/storages/{storage_id}/files/{file_id}")
+async def update_file_metadata(storage_id: int, file_id: int, metadata: dict = Body(
+    ..., example={"name": "new_name.pdf", "description": "Updated description"}
+    )):
+    """
+    Update file metadata
+    
+    Args:
+        storage_id: int - ID of storage
+        file_id: int - ID of file
+        metadata: dict with fields to update
+        
+    Returns:
+        Updated file information
+    """
+    try:
+        result = update_file_info(storage_id, file_id, metadata)
+        return JSONResponse(
+            content={"status": "success", "data": result}
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(e)
+        )
 
 
 if __name__ == '__main__':
     import uvicorn
-    # Create dummy model when the app starts
-    create_dummy_model_if_not_exists()
 
     uvicorn.run(app, host='localhost', port=8040)

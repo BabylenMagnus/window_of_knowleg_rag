@@ -25,7 +25,9 @@ CREATE TABLE files (
     name VARCHAR(255) NOT NULL,
     local_path TEXT NOT NULL,
     type VARCHAR(50) NOT NULL CHECK (type IN ('image', 'video', 'link', 'pdf')),
-    source VARCHAR(50)
+    source VARCHAR(50),
+    storage_id INT NOT NULL,
+    FOREIGN KEY (storage_id) REFERENCES storages(id) ON DELETE CASCADE
 );
 
 CREATE TABLE chats (

@@ -5,6 +5,7 @@ from psycopg2.extras import RealDictCursor
 import random
 import string
 import logging
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -330,5 +331,443 @@ def get_last_n_messages(chat_id: int, n: int = 5):
             # Reverse the messages to get them in chronological order
             messages.reverse()
         return [serialize_db_result(msg) for msg in messages]
+    finally:
+        conn.close()
+
+
+def update_storage(storage_id: int, name: str, description: str = None):
+    """
+    Update storage name and description
+    
+    Args:
+        storage_id (int): ID of storage to update
+        name (str): New name for storage
+        description (str, optional): New description for storage
+    
+    Returns:
+        Dict with updated storage information
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            if description is not None:
+                cur.execute(
+                    """
+                    UPDATE storages 
+                    SET name = %s, description = %s, updated_at = NOW() 
+                    WHERE id = %s 
+                    RETURNING *
+                    """,
+                    (name, description, storage_id)
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE storages 
+                    SET name = %s, updated_at = NOW() 
+                    WHERE id = %s 
+                    RETURNING *
+                    """,
+                    (name, storage_id)
+                )
+            updated_storage = cur.fetchone()
+            if not updated_storage:
+                raise ValueError(f"Storage with ID {storage_id} not found")
+            conn.commit()
+            return serialize_db_result(updated_storage)
+    finally:
+        conn.close()
+
+
+def get_storage_files(storage_id: int):
+    """
+    Получить список файлов для указанного хранилища
+    
+    Args:
+        storage_id (int): ID хранилища
+    
+    Returns:
+        list: Список файлов в хранилище
+    """
+    import logging
+    import traceback
+    from datetime import datetime
+    from psycopg2.extras import RealDictCursor
+
+    # Настройка логирования
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+
+    def serialize_datetime(obj):
+        """
+        Преобразует объекты datetime в строки ISO формата
+        """
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return obj
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            # Проверяем существование хранилища
+            cursor.execute("SELECT * FROM storages WHERE id = %s", (storage_id,))
+            storage = cursor.fetchone()
+            
+            if not storage:
+                logger.error(f"Storage with ID {storage_id} not found")
+                raise ValueError(f"Хранилище с ID {storage_id} не найдено")
+            
+            # Получаем список файлов для хранилища
+            cursor.execute(
+                """
+                SELECT 
+                    id, name, local_path, type, source, 
+                    created_at, updated_at
+                FROM files 
+                WHERE storage_id = %s
+                ORDER BY created_at DESC
+                """, 
+                (storage_id,)
+            )
+            files = cursor.fetchall()
+            
+            # Преобразуем datetime в строки
+            serialized_files = [
+                {k: serialize_datetime(v) for k, v in file.items()} 
+                for file in files
+            ]
+            
+            logger.info(f"Retrieved {len(serialized_files)} files for storage {storage_id}")
+            
+            return serialized_files
+    except Exception as e:
+        logger.error(f"Error retrieving files for storage {storage_id}: {e}")
+        logger.error(traceback.format_exc())
+        
+        raise ValueError(f"Не удалось получить файлы хранилища: {str(e)}")
+    finally:
+        conn.close()
+
+
+def get_file_details(storage_id: int, file_id: int):
+    """
+    Get detailed information about a specific file
+    
+    Args:
+        storage_id (int): ID of storage
+        file_id (int): ID of file
+    
+    Returns:
+        Dict with file information including metadata
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT f.*, m.metadata 
+                FROM files f 
+                JOIN storage_files sf ON f.id = sf.file_id
+                LEFT JOIN file_metadata m ON f.id = m.file_id 
+                WHERE sf.storage_id = %s AND f.id = %s
+                """,
+                (storage_id, file_id)
+            )
+            file = cur.fetchone()
+            if not file:
+                raise ValueError(f"File with ID {file_id} not found in storage {storage_id}")
+            return serialize_db_result(file)
+    finally:
+        conn.close()
+
+
+def save_file(storage_id: int, filename: str, local_path: str, file_type: str, source: str = None, description: str = None):
+    """
+    Save file information to database
+    
+    Args:
+        storage_id (int): ID of storage
+        filename (str): Original filename
+        local_path (str): Path where file is stored locally
+        file_type (str): Type of file (pdf, image, etc)
+        source (str, optional): Source of file (upload, url)
+        description (str, optional): File description
+    
+    Returns:
+        Dict with created file information
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Verify storage exists
+            cur.execute("SELECT id FROM storages WHERE id = %s", (storage_id,))
+            if not cur.fetchone():
+                raise ValueError(f"Storage with ID {storage_id} not found")
+            
+            # Create file record
+            cur.execute(
+                """
+                INSERT INTO files (name, local_path, type, source)
+                VALUES (%s, %s, %s, %s)
+                RETURNING *
+                """,
+                (filename, local_path, file_type, source)
+            )
+            file = cur.fetchone()
+            file_id = file[0]  # Get the ID of created file
+            
+            # Link file to storage
+            cur.execute(
+                """
+                INSERT INTO storage_files (storage_id, file_id)
+                VALUES (%s, %s)
+                """,
+                (storage_id, file_id)
+            )
+            
+            # Add metadata if description provided
+            if description:
+                cur.execute(
+                    """
+                    INSERT INTO file_metadata (file_id, metadata)
+                    VALUES (%s, %s::jsonb)
+                    """,
+                    (file_id, json.dumps({"description": description}))
+                )
+            
+            conn.commit()
+            return serialize_db_result(file)
+    finally:
+        conn.close()
+
+
+def get_storage_by_id(storage_id: int):
+    """
+    Получить информацию о хранилище по его ID
+    
+    Args:
+        storage_id (int): ID хранилища
+    
+    Returns:
+        dict: Информация о хранилище
+    """
+    import logging
+    import traceback
+    from psycopg2.extras import RealDictCursor
+
+    # Настройка логирования
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+
+    conn = get_db_connection()
+    try:
+        # Используем RealDictCursor для словарного доступа
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            # Получаем информацию о хранилище
+            cursor.execute("SELECT * FROM storages WHERE id = %s", (storage_id,))
+            storage = cursor.fetchone()
+            
+            if not storage:
+                logger.error(f"Storage with ID {storage_id} not found")
+                raise ValueError(f"Хранилище с ID {storage_id} не найдено")
+            
+            return dict(storage)
+    except Exception as e:
+        logger.error(f"Ошибка при получении хранилища: {e}")
+        logger.error(traceback.format_exc())
+        
+        raise ValueError(f"Ошибка при получении хранилища: {str(e)}")
+    finally:
+        conn.close()
+
+
+def add_url_to_storage_collection(storage_id: int, url: str):
+    """
+    Добавить URL в хранилище
+    
+    Args:
+        storage_id (int): ID хранилища
+        url (str): URL для добавления
+    
+    Returns:
+        dict: Информация о добавленном URL
+    """
+    import traceback
+    import logging
+    from datetime import datetime
+    from psycopg2.extras import RealDictCursor
+
+    # Настройка логирования
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+
+    def serialize_datetime(obj):
+        """
+        Преобразует объекты datetime в строки ISO формата
+        """
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return obj
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            # Проверяем существование хранилища
+            logger.info(f"Checking storage with ID: {storage_id}")
+            cursor.execute("SELECT * FROM storages WHERE id = %s", (storage_id,))
+            storage = cursor.fetchone()
+            
+            if not storage:
+                logger.error(f"Storage with ID {storage_id} not found")
+                raise ValueError(f"Хранилище с ID {storage_id} не найдено")
+            
+            logger.info(f"Adding URL: {url} to storage")
+            
+            # Создаем файл для URL с указанием storage_id
+            cursor.execute(
+                """
+                INSERT INTO files 
+                (name, local_path, type, source, storage_id) 
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, name, local_path, type, source, storage_id, created_at, updated_at
+                """, 
+                (url, url, 'link', 'url', storage_id)
+            )
+            file_info = cursor.fetchone()
+            
+            # Преобразуем datetime в строки
+            serialized_file_info = {
+                k: serialize_datetime(v) for k, v in file_info.items()
+            }
+            
+            conn.commit()
+            logger.info(f"Successfully added URL file with ID: {serialized_file_info['id']}")
+            
+            return serialized_file_info
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error in add_url_to_storage_collection: {e}")
+        logger.error(traceback.format_exc())
+        
+        raise ValueError(f"Не удалось добавить URL: {str(e)}")
+    finally:
+        conn.close()
+
+
+def delete_storage_file(storage_id: int, file_id: int):
+    """
+    Delete file from storage
+    
+    Args:
+        storage_id (int): ID of storage
+        file_id (int): ID of file
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Verify file exists in storage
+            cur.execute(
+                """
+                SELECT f.id, f.local_path 
+                FROM files f
+                JOIN storage_files sf ON f.id = sf.file_id
+                WHERE sf.storage_id = %s AND f.id = %s
+                """,
+                (storage_id, file_id)
+            )
+            file = cur.fetchone()
+            if not file:
+                raise ValueError(f"File with ID {file_id} not found in storage {storage_id}")
+            
+            # Delete file from storage_files (cascades to file_metadata)
+            cur.execute(
+                "DELETE FROM storage_files WHERE storage_id = %s AND file_id = %s",
+                (storage_id, file_id)
+            )
+            
+            # Delete file record (will cascade delete metadata)
+            cur.execute("DELETE FROM files WHERE id = %s", (file_id,))
+            conn.commit()
+            
+            # Return local path for physical file deletion
+            return file[1]
+    finally:
+        conn.close()
+
+
+def update_file_info(storage_id: int, file_id: int, metadata: dict):
+    """
+    Update file metadata
+    
+    Args:
+        storage_id (int): ID of storage
+        file_id (int): ID of file
+        metadata (dict): New metadata values
+    
+    Returns:
+        Dict with updated file information
+    """
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Verify file exists in storage
+            cur.execute(
+                """
+                SELECT f.id 
+                FROM files f
+                JOIN storage_files sf ON f.id = sf.file_id
+                WHERE sf.storage_id = %s AND f.id = %s
+                """,
+                (storage_id, file_id)
+            )
+            if not cur.fetchone():
+                raise ValueError(f"File with ID {file_id} not found in storage {storage_id}")
+            
+            # Update file name if provided
+            if "name" in metadata:
+                cur.execute(
+                    """
+                    UPDATE files 
+                    SET name = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (metadata["name"], file_id)
+                )
+            
+            # Update or insert metadata
+            cur.execute(
+                """
+                INSERT INTO file_metadata (file_id, metadata)
+                VALUES (%s, %s::jsonb)
+                ON CONFLICT (file_id) DO UPDATE
+                SET metadata = file_metadata.metadata || EXCLUDED.metadata,
+                    updated_at = NOW()
+                RETURNING *
+                """,
+                (file_id, json.dumps(metadata))
+            )
+            
+            # Get updated file info
+            cur.execute(
+                """
+                SELECT f.*, m.metadata 
+                FROM files f
+                LEFT JOIN file_metadata m ON f.id = m.file_id
+                WHERE f.id = %s
+                """,
+                (file_id,)
+            )
+            file = cur.fetchone()
+            conn.commit()
+            return serialize_db_result(file)
     finally:
         conn.close()
